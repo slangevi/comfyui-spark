@@ -47,4 +47,19 @@ if docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 \
 fi
 echo "    refused to start with an unwritable /data"
 
+# Case 7 — an interrupted first boot (venv created, .pth not yet written)
+# must self-heal on the next start rather than hand off to a broken
+# interpreter. Simulate the interruption by deleting the .pth Case 1 already
+# wrote, out from under an otherwise-intact venv.
+PTH="$(find "$TMP/venv" -name '_baked_venv.pth')"
+[ -n "$PTH" ] || { echo "FAIL: expected an existing _baked_venv.pth from Case 1 before simulating an interrupted boot" >&2; exit 1; }
+rm -f "$PTH"
+if docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+        -c 'import torch' >/dev/null 2>&1; then
+    echo "FAIL: overlay venv still imported torch after removing its .pth — test setup is invalid" >&2; exit 1
+fi
+docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 -v "$TMP:/data" "$IMAGE" >/dev/null
+docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+    -c 'import torch; print("    overlay venv self-healed after a simulated interrupted boot, torch", torch.__version__)'
+
 echo "==> verify-entrypoint: PASS"

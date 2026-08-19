@@ -53,19 +53,40 @@ done
 #    file instead; site.py appends it to sys.path after the overlay's own
 #    site-packages, so a node that installs a newer version of a baked
 #    package still shadows it (the precedence spec §7.2 requires).
-if [ ! -x "$DATA_DIR/venv/bin/python" ]; then
-    log "creating the overlay venv at $DATA_DIR/venv"
+#
+#    "ready" means the interpreter exists AND can actually import torch —
+#    not merely that `venv` finished — because those are two separate steps
+#    (create the venv, then write the .pth) and a container killed between
+#    them (OOM, host reboot, `docker stop` mid-first-boot) would otherwise
+#    leave an executable-but-broken bin/python that every later start would
+#    treat as done. Detect that half-built state and rebuild rather than
+#    hand off to an interpreter that can't import torch.
+overlay_venv_ready() {
+    [ -x "$DATA_DIR/venv/bin/python" ] \
+        && "$DATA_DIR/venv/bin/python" -c 'import torch' >/dev/null 2>&1
+}
+
+if ! overlay_venv_ready; then
+    if [ -e "$DATA_DIR/venv" ]; then
+        log "overlay venv at $DATA_DIR/venv exists but can't import torch — an earlier start was likely interrupted before it finished; rebuilding"
+        rm -rf "$DATA_DIR/venv"
+    else
+        log "creating the overlay venv at $DATA_DIR/venv"
+    fi
     /opt/venv/bin/python -m venv "$DATA_DIR/venv"
     BAKED_SITE="$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
     OVERLAY_SITE="$("$DATA_DIR/venv/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
     echo "$BAKED_SITE" > "$OVERLAY_SITE/_baked_venv.pth"
+    overlay_venv_ready || die "overlay venv at $DATA_DIR/venv still can't import torch after rebuilding it — check that /opt/venv itself has torch installed"
 fi
 
 # 5. ComfyUI-Manager, first start only.
 if [ ! -d "$DATA_DIR/custom_nodes/ComfyUI-Manager" ]; then
     log "cloning ComfyUI-Manager @ ${MANAGER_REF}"
     git clone --filter=blob:none "$MANAGER_REPO" "$DATA_DIR/custom_nodes/ComfyUI-Manager"
-    git -C "$DATA_DIR/custom_nodes/ComfyUI-Manager" checkout "$MANAGER_REF"
+    # advice.detachedHead=false: this prints straight to container stdout on
+    # every fresh deployment (docker compose logs), not just in a terminal.
+    git -c advice.detachedHead=false -C "$DATA_DIR/custom_nodes/ComfyUI-Manager" checkout "$MANAGER_REF"
     if [ -f "$DATA_DIR/custom_nodes/ComfyUI-Manager/requirements.txt" ]; then
         "$DATA_DIR/venv/bin/pip" install --no-cache-dir \
             -r "$DATA_DIR/custom_nodes/ComfyUI-Manager/requirements.txt"
