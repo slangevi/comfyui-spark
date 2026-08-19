@@ -38,16 +38,37 @@ fi
 echo "fetching $FILENAME"
 echo "     to  $DEST_DIR"
 
+# The token is attached on an exact host match, never a substring match:
+# *huggingface.co* would also match huggingface.co.evil.example (or the
+# string anywhere in a path or query) and hand the bearer token to a host
+# the user never intended. curl already strips the header on a cross-host
+# redirect, so the CDN hop stays tokenless either way.
+host="$(printf '%s' "$URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?@]*@)?([^/:?]+).*#\2#')"
 auth=()
-if [ -n "${HF_TOKEN:-}" ] && [[ "$URL" == *huggingface.co* ]]; then
-    auth=(-H "Authorization: Bearer ${HF_TOKEN}")
-    echo "     using HF_TOKEN"
-fi
+case "$host" in
+    huggingface.co|*.huggingface.co)
+        if [ -n "${HF_TOKEN:-}" ]; then
+            auth=(-H "Authorization: Bearer ${HF_TOKEN}")
+            echo "     using HF_TOKEN"
+        fi
+        ;;
+esac
 
 # --continue-at - resumes a partial download; multi-GB files over a flaky
-# link should not restart from zero.
+# link should not restart from zero. But only resume OUR OWN partial: a
+# leftover .part from a different URL with the same basename would be
+# silently spliced into corrupt weights. The .part.url marker records which
+# download a .part belongs to; on mismatch, start over.
+if [ -f "${DEST}.part" ]; then
+    if [ ! -f "${DEST}.part.url" ] || [ "$(cat "${DEST}.part.url")" != "$URL" ]; then
+        echo "     discarding a leftover partial from a different download"
+        rm -f "${DEST}.part" "${DEST}.part.url"
+    fi
+fi
+printf '%s' "$URL" > "${DEST}.part.url"
 curl -fL --progress-bar --continue-at - "${auth[@]}" -o "${DEST}.part" "$URL"
 mv "${DEST}.part" "$DEST"
+rm -f "${DEST}.part.url"
 
 echo "done: $DEST ($(du -h "$DEST" | cut -f1))"
 echo "ComfyUI picks it up on the next refresh; no restart needed."
