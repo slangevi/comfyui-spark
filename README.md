@@ -145,10 +145,17 @@ impossible.
 
 The gap it cannot close is a change made *while the service is up*: install a
 custom node whose `requirements.txt` names `torch` and Manager may put a
-CPU-only build into `/data/venv`, where it shadows the baked one. Nothing
-changes until the next restart — and that restart then refuses to start, with
-a message naming overlay shadowing as the likely cause and telling you where
-to look. To fix it:
+CPU-only build into `/data/venv`, where it shadows the baked one. The
+entrypoint's guards catch that on the next **container start** — `make down
+&& make up`, `docker compose up -d`, a host reboot, a force-recreate — but
+not on Manager's own in-UI "Restart" button or its deferred-install restart,
+both of which `os.execv` a fresh `main.py` from inside the already-running
+container without ever re-running the entrypoint. The healthcheck stays
+green through either path: it only checks `/system_stats`'s HTTP status, not
+which device answered. After installing a node, check for real —
+`./scripts/verify-gpu.sh` (it interrogates the live container's overlay
+interpreter) or `curl -s localhost:8188/system_stats` to read the device
+directly. To fix it:
 
 ```bash
 docker compose exec comfyui /data/venv/bin/pip list --local | grep -i torch
