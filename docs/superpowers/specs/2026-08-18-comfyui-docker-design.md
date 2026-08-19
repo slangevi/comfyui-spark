@@ -318,12 +318,17 @@ Written before the implementation, per TDD. Each is a standalone script;
 | `verify-gpu.sh` | Inside the container: `torch.cuda.is_available()`, device name contains `GB10`, capability `(12, 1)`, and a bf16 matmul returns finite values |
 | `verify-entrypoint.sh` | The six §7.6 startup behaviors: `/data` seeded, overlay venv created, Manager cloned once and not re-cloned, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused |
 | `verify-http.sh` | `GET /system_stats` returns 200 and lists a CUDA device |
-| `verify-persistence.sh` | `pip install six` (tiny, pure-Python, and not a ComfyUI dependency, so it can only have come from the overlay) into `/data/venv`, `docker compose restart`, then assert it is still importable **and** still reported by `pip list --local` |
+| `verify-persistence.sh` | `pip install six` (tiny, pure-Python, and not a ComfyUI dependency, so it can only have come from the overlay) into `/data/venv`, `docker compose up -d --force-recreate`, then assert it is still importable **and** still reported by `pip list --local` |
 | `verify-e2e.sh` | `POST /prompt` with a minimal workflow, poll `/history`, assert a PNG appears in `/data/output`. Skips with an explicit message when no checkpoint is installed |
 
 `verify-persistence.sh` is the one that would have caught the naive design, so it
 must fail against a container built without the overlay venv before it passes
-with one.
+with one. It challenges with `--force-recreate`, not `docker compose restart`:
+a plain restart reuses the same container and never discards its writable
+layer, so a package installed straight into the baked `/opt/venv` would
+"survive" a restart too — only recreating the container from the image
+actually exercises the bind-mount-vs-image-layer distinction this test exists
+to prove.
 
 ## 9. Failure modes
 
