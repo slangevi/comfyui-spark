@@ -159,13 +159,24 @@ interpreter:
 - `/data/venv` — **on the bind mount**, created by the entrypoint on first run:
 
   ```
-  /opt/venv/bin/python -m venv --system-site-packages /data/venv
+  /opt/venv/bin/python -m venv /data/venv
+  echo "$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
+      > "$(/data/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')/_baked_venv.pth"
   ```
+
+  A plain `venv --system-site-packages /data/venv` was tried first and does
+  **not** work here: `/opt/venv` is itself a venv, and since Python 3.11 a
+  nested venv's `--system-site-packages` resolves against the real base
+  interpreter (`sys._base_executable`), not the immediate parent venv — so it
+  would see the OS's `dist-packages`, never `/opt/venv`'s torch. A `.pth` file
+  naming `/opt/venv`'s site-packages achieves the same inheritance directly.
 
 ComfyUI is launched with `/data/venv/bin/python`. Consequences:
 
-- `--system-site-packages` means the overlay inherits baked torch; a ~3 GB
-  download never happens at boot.
+- The `.pth` file means the overlay inherits baked torch; a ~3 GB
+  download never happens at boot. `site.py` appends the `.pth` target to
+  `sys.path` after the overlay's own site-packages, so precedence is preserved
+  (next bullet).
 - ComfyUI-Manager shells out to `sys.executable`, which **is** `/data/venv`, so
   every package it installs lands on the bind mount and survives restarts.
 - A node requiring a newer version of a baked package installs it into the
@@ -259,7 +270,8 @@ In order, failing fast with a distinct message at each step:
 1. Assert `/data` exists and is writable → else exit 1.
 2. Assert an NVIDIA device is visible, unless `COMFYUI_ALLOW_CPU=1` → else exit 1.
 3. `mkdir -p` the `/data` tree from §7.3.
-4. Create `/data/venv` if absent (`--system-site-packages`).
+4. Create `/data/venv` if absent, linked to `/opt/venv`'s site-packages via
+   `.pth` file (§7.2).
 5. Clone pinned ComfyUI-Manager into `/data/custom_nodes/` if absent.
 6. `exec /data/venv/bin/python /opt/comfyui/main.py --listen 0.0.0.0 --port 8188
    --base-directory /data --disable-auto-launch ${COMFYUI_ARGS}`
@@ -291,7 +303,7 @@ The Makefile is the documented interface; every target is a thin wrapper over
 | `up` / `down` | Start / stop the service |
 | `logs` | `docker compose logs -f comfyui` |
 | `shell` | Interactive shell in the running container |
-| `verify` | Runs `verify-gpu`, `verify-http`, `verify-persistence`, then attempts `verify-e2e` |
+| `verify` | Runs verify-gpu, verify-entrypoint, verify-http, verify-persistence, then attempts verify-e2e |
 | `reset-venv` | Deletes `/data/venv`; recreated on next start (§9) |
 | `update-comfyui` | Prints the newest upstream tag and SHA to paste into the Dockerfile (§10) |
 | `fetch-model` | Wrapper over `scripts/fetch-model.sh` |
@@ -299,11 +311,12 @@ The Makefile is the documented interface; every target is a thin wrapper over
 ## 8. Verification
 
 Written before the implementation, per TDD. Each is a standalone script;
-`make verify` runs 1–3 and attempts 4.
+`make verify` runs 1–4 and attempts 5.
 
 | Script | Asserts |
 |---|---|
 | `verify-gpu.sh` | Inside the container: `torch.cuda.is_available()`, device name contains `GB10`, capability `(12, 1)`, and a bf16 matmul returns finite values |
+| `verify-entrypoint.sh` | The six §7.6 startup behaviors: `/data` seeded, overlay venv created, Manager cloned once and not re-cloned, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused |
 | `verify-http.sh` | `GET /system_stats` returns 200 and lists a CUDA device |
 | `verify-persistence.sh` | `pip install six` (tiny, pure-Python, and not a ComfyUI dependency, so it can only have come from the overlay) into `/data/venv`, `docker compose restart`, then assert it is still importable **and** still reported by `pip list --local` |
 | `verify-e2e.sh` | `POST /prompt` with a minimal workflow, poll `/history`, assert a PNG appears in `/data/output`. Skips with an explicit message when no checkpoint is installed |

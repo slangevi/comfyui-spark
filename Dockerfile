@@ -53,6 +53,10 @@ RUN git clone --filter=blob:none https://github.com/Comfy-Org/ComfyUI.git /opt/c
  && pip install --no-cache-dir -r /opt/comfyui/requirements.txt \
  && chown -R "${PUID}:${PGID}" /opt/comfyui
 
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 USER comfy
 WORKDIR /opt/comfyui
 EXPOSE 8188
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
