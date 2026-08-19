@@ -57,10 +57,13 @@ This is the single most important assumption in the design, so
    tag or SHA, with a dated comment, matching the convention in
    `sparkyard/llama-cpp/llama-cpp.Dockerfile` — the base image (manifest
    digest), the torch trio, the ComfyUI ref and the ComfyUI-Manager ref.
-   Transitive pip dependencies are **not** pinned: `pip install -r
+   The torch trio is additionally constrained at **runtime**: the image bakes
+   `/opt/constraints.txt` and sets `PIP_CONSTRAINT`/`UV_CONSTRAINT`, so no
+   in-container install can replace torch with a different build. Transitive
+   pip dependencies are still **not** pinned: `pip install -r
    requirements.txt` re-resolves them on every build, so two builds of the
-   same Dockerfile can differ in those. A constraints/lock file would close
-   that gap and is deliberately deferred (§11).
+   same Dockerfile can differ in those. A full lock file would close that gap
+   and is deliberately deferred (§11).
 5. A GPU misconfiguration fails loudly at startup rather than silently
    degrading to CPU — asserted on the interpreter that actually renders
    (`/data/venv`), not only on the baked one (§7.6 steps 2 and 7).
@@ -170,16 +173,23 @@ interpreter:
 
   ```
   /opt/venv/bin/python -m venv /data/venv
-  echo "$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
-      > "$(/data/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')/_baked_venv.pth"
+  # _baked_venv.pth, written into the overlay's site-packages:
+  #   import site; site.addsitedir('/opt/venv/lib/python3.12/site-packages')
   ```
 
   A plain `venv --system-site-packages /data/venv` was tried first and does
   **not** work here: `/opt/venv` is itself a venv, and since Python 3.11 a
   nested venv's `--system-site-packages` resolves against the real base
   interpreter (`sys._base_executable`), not the immediate parent venv — so it
-  would see the OS's `dist-packages`, never `/opt/venv`'s torch. A `.pth` file
-  naming `/opt/venv`'s site-packages achieves the same inheritance directly.
+  would see the OS's `dist-packages`, never `/opt/venv`'s torch. The `.pth`
+  file uses the executable `import site; site.addsitedir(...)` form rather
+  than a plain path line: `site.py` appends a plain path to `sys.path` but
+  does not process the `.pth` files *inside* it, so setuptools'
+  `distutils-precedence.pth` never ran and `import distutils` failed on the
+  overlay interpreter. `addsitedir` processes them, and still appends after
+  the overlay's own site-packages, preserving overlay-shadows-baked. The
+  entrypoint rewrites the file idempotently on every healthy start, healing
+  older plain-path deployments.
 
 ComfyUI is launched with `/data/venv/bin/python`. Consequences:
 
@@ -268,6 +278,9 @@ services:
     image: comfyui-spark:latest
     container_name: comfyui
     restart: unless-stopped
+    init: true                     # reap node subprocesses; forward signals
+    stop_signal: SIGINT            # python handles SIGINT; PID 1 ignores an
+    stop_grace_period: 30s         #   unhandled SIGTERM (stop was a SIGKILL)
     ipc: host                      # shared memory with the GPU driver
     security_opt: [seccomp:unconfined]
     ulimits:
@@ -282,16 +295,26 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
       - UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
+      # The image also bakes /opt/constraints.txt pinning the torch trio and
+      # sets PIP_CONSTRAINT/UV_CONSTRAINT to it, so any runtime install that
+      # names torch resolves to the exact cu130 builds or fails loudly —
+      # prevention, where the extra index alone was only mitigation.
     deploy:
       resources:
         reservations:
           devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8188/system_stats"]
+      # Parses /system_stats and requires the primary device to be CUDA
+      # (unless COMFYUI_ALLOW_CPU=1): HTTP 200 alone stays green while
+      # rendering on CPU, including after a Manager in-UI restart that
+      # bypasses the entrypoint.
+      test: ["CMD", "python3", "-c", "<exit 0 iff devices[0].type=='cuda'
+             or COMFYUI_ALLOW_CPU=1 — see docker-compose.yml for the real
+             one-liner>"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 300s           # above the 240s cold-start budget
 ```
 
 The `ipc`, `security_opt`, and `ulimits` settings are carried over from the
@@ -341,13 +364,23 @@ In order, failing fast with a distinct message at each step:
    (re)install its requirements whenever either the overlay venv or the
    Manager install did not previously complete (§7.3).
 6. Force `use_uv = False` in Manager's `config.ini`, creating the file if
-   absent and leaving every other setting in it alone (§7.2).
+   absent and leaving every other setting in it alone (§7.2). A rewrite that
+   fails (unreadable file, unwritable directory) is fatal, not skipped — a
+   silent skip would quietly disable the uv guard.
 7. Assert `/data/venv`'s torch sees a CUDA device, unless
    `COMFYUI_ALLOW_CPU=1` → else exit 1, naming overlay shadowing as the likely
    cause and giving the two recoveries (uninstall the overlay copy, or
    `make reset-venv`).
-8. `exec /data/venv/bin/python /opt/comfyui/main.py --listen 0.0.0.0 --port 8188
-   --base-directory /data --disable-auto-launch ${COMFYUI_ARGS}`
+8. Export `VIRTUAL_ENV`/`PATH` for the overlay (so bare `pip` inside the
+   container targets `/data/venv`, not the root-owned baked venv — the image
+   `ENV` carries the same values so `docker compose exec` shells, which never
+   see the entrypoint's exports, resolve identically), `set -f`
+   (word-split `COMFYUI_ARGS` without pathname expansion against the cwd),
+   then `exec /data/venv/bin/python /opt/comfyui/main.py --listen 0.0.0.0
+   --port 8188 --base-directory /data --disable-auto-launch ${COMFYUI_ARGS}`,
+   appending `--cpu` when `COMFYUI_ALLOW_CPU=1` — without it the pinned
+   ComfyUI executes `torch.cuda.current_device()` unguarded at import and
+   crash-loops on a GPU-less host.
 
 Step 2 exists because the worst failure mode is not a crash — it is ComfyUI
 silently running on CPU and the user discovering it forty minutes into a render.
@@ -374,7 +407,7 @@ never exits.
 | `COMFYUI_ARGS` | `--highvram --use-pytorch-cross-attention` | Appended to the `main.py` command line |
 | `PUID` / `PGID` | `1000` / `1000` | Container user, so `/data` files are owned by `scott` |
 | `HF_TOKEN` | empty | Optional, for gated repos. Read by `fetch-model.sh` on the host **and** injected into the container, where Manager's downloader and `huggingface-hub` use it — so every custom node can read it. Use a read-only, minimally-scoped token |
-| `COMFYUI_ALLOW_CPU` | unset | Set to `1` to bypass both of the entrypoint's GPU assertions |
+| `COMFYUI_ALLOW_CPU` | unset | Set to `1` to bypass both of the entrypoint's GPU assertions, append `--cpu` to ComfyUI's command line, and relax the healthcheck |
 | `COMFYUI_SKIP_LAUNCH` | unset | Set to `1` to run the entrypoint's preparation and stop before launching ComfyUI. Testing seam for `verify-entrypoint.sh`; not exposed in `docker-compose.yml` |
 
 ### 7.8 Makefile targets
@@ -401,7 +434,7 @@ Written before the implementation, per TDD. Each is a standalone script;
 | Script | Asserts |
 |---|---|
 | `verify-gpu.sh` | The same assertion against **both** interpreters — `torch.cuda.is_available()`, device name contains `GB10`, capability `(12, 1)`, a bf16 matmul returns finite values: on `/opt/venv` in the image (the only check a freshly built image can make), and on `/data/venv` in the **running** container, which is the one that renders. Skips the second only when no overlay venv exists yet |
-| `verify-entrypoint.sh` | The §7.6 startup contract against a throwaway `/data`, in 13 cases: the six documented behaviors (`/data` seeded, overlay venv created, Manager installed once and not re-installed, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused), plus the recovery paths — interrupted venv build rebuilt, previously-working venv refused rather than wiped, Manager requirements reinstalled after a venv rebuild, `reset-venv` recovery, a clone killed in flight self-healing to the pinned ref, an interrupted requirements install reinstalled without re-cloning, `use_uv = False` seeded and repaired, and an overlay venv that cannot reach the GPU refused both before and after the readiness check |
+| `verify-entrypoint.sh` | The §7.6 startup contract against a throwaway `/data`, in 18 cases: the six documented behaviors (`/data` seeded, overlay venv created, Manager installed once and not re-installed, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused), plus the recovery paths — interrupted venv build rebuilt, previously-working venv refused rather than wiped, Manager requirements reinstalled after a venv rebuild, `reset-venv` recovery, a clone killed in flight self-healing to the pinned ref, an interrupted requirements install reinstalled without re-cloning, `use_uv = False` seeded and repaired, and an overlay venv that cannot reach the GPU refused both before and after the readiness check — plus a sentinel-less no-cuda overlay refused rather than wiped, a plain-path `.pth` healed to the import form (with `import distutils` proving it), a missing `.manager-ready` re-triggering the requirements install, an unprocessable Manager config being fatal, and `COMFYUI_ALLOW_CPU=1` booting a real CPU service via the appended `--cpu` |
 | `verify-http.sh` | `GET /system_stats` returns 200 and lists a CUDA device |
 | `verify-persistence.sh` | `pip install pyjokes` (tiny, pure-Python, dependency-free, and nothing in the ML stack can drag it in) into `/data/venv`, `docker compose up -d --force-recreate`, then assert it is still importable **and** still reported by `pip list --local`. Never uninstalls a package it did not install: the probe is skipped if already present, and the cleanup trap reports rather than silently no-ops when it cannot reach the container |
 | `verify-e2e.sh` | `POST /prompt` with a minimal workflow, poll `/history`, assert a PNG appears in `/data/output`. Skips with an explicit message when no checkpoint is installed |

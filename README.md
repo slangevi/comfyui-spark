@@ -30,7 +30,12 @@ What to expect the first time:
   finds half-done), but you will just wait again next time.
 - `make verify` **force-recreates the running container** as part of the
   persistence test, which interrupts any generation in flight. Run it when
-  the machine is idle.
+  the machine is idle. It also reaches PyPI twice (a test install, and the
+  entrypoint cold-start cases), so it can fail on a transient network error
+  that has nothing to do with this code — re-run it before suspecting the
+  build.
+- Changing `PUID`/`PGID` in `.env` requires `make build` — they are build
+  args, and `make up` never rebuilds.
 
 ## Getting models
 
@@ -143,19 +148,24 @@ the overlay venv that actually renders — and refuses to start if either
 cannot reach the GPU, so a silent CPU fallback at startup should be
 impossible.
 
-The gap it cannot close is a change made *while the service is up*: install a
-custom node whose `requirements.txt` names `torch` and Manager may put a
-CPU-only build into `/data/venv`, where it shadows the baked one. The
-entrypoint's guards catch that on the next **container start** — `make down
-&& make up`, `docker compose up -d`, a host reboot, a force-recreate — but
-not on Manager's own in-UI "Restart" button or its deferred-install restart,
-both of which `os.execv` a fresh `main.py` from inside the already-running
-container without ever re-running the entrypoint. The healthcheck stays
-green through either path: it only checks `/system_stats`'s HTTP status, not
-which device answered. After installing a node, check for real —
-`./scripts/verify-gpu.sh` (it interrogates the live container's overlay
-interpreter) or `curl -s localhost:8188/system_stats` to read the device
-directly. To fix it:
+The remaining exposure is a change made *while the service is up*: a custom
+node whose `requirements.txt` names `torch` could ask for a reinstall into
+`/data/venv`, where it would shadow the baked build. Three layers stand in
+the way. First, prevention: a constraints file baked into the image
+(`PIP_CONSTRAINT`/`UV_CONSTRAINT`) forces any in-container install of the
+torch trio to the exact `cu130` builds — a wrong-build shadow now fails the
+install loudly instead of succeeding quietly. Second, the entrypoint's
+guards re-check on every **container start** — `make down && make up`, a
+host reboot, a force-recreate (a bare `docker compose up -d` on a running
+container is a no-op and re-runs nothing). Manager's own in-UI "Restart"
+button and its deferred-install restart bypass those guards (`os.execv`
+replaces `main.py` without re-running the entrypoint) — which is where the
+third layer comes in: the healthcheck parses `/system_stats` and requires
+the primary device to be CUDA, so a container that somehow ends up rendering
+on CPU flips to `unhealthy` in `docker ps` within about 90 seconds, however
+it got there. After installing a node, `./scripts/verify-gpu.sh` remains the
+definitive check (it interrogates the live container's overlay interpreter).
+To fix a shadowed overlay:
 
 ```bash
 docker compose exec comfyui /data/venv/bin/pip list --local | grep -i torch
