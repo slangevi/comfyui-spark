@@ -686,6 +686,8 @@ so a service that came up on the CPU fails rather than looking healthy."
 
 The load-bearing test. The two-layer venv exists solely to make this pass, so it must be shown to fail without the overlay before it is trusted passing with it.
 
+> **Superseded during implementation:** every `docker compose restart` in this task (Steps 1 and 2 below) is wrong and was replaced by `docker compose up -d --force-recreate`. A restart reuses the same container object and never discards its writable layer, so a package installed into the baked `/opt/venv` "survives" it too and the test proves nothing. See spec §8. The probe package also changed from `six` to `pyjokes`, and the assertion after the recreate now re-checks `pip list --local`, not only `import`. This section is left as written for the record; the shipped script is the authority.
+
 **Files:**
 - Test: `scripts/verify-persistence.sh`
 
