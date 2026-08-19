@@ -259,6 +259,8 @@ for line in lines:
     out.append(line)
 
 if section == "default" and not done:
+    if out and not out[-1].endswith("\n"):
+        out.append("\n")
     out.append("use_uv = False\n")
     done = changed = True
 if not done:
