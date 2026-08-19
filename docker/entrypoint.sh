@@ -118,6 +118,20 @@ overlay_state_ready() {
     esac
 }
 
+# The .pth line is `import site; site.addsitedir(...)` rather than a plain
+# path: site.py appends a plain path to sys.path but does NOT process the .pth
+# files inside it, so the baked layer's own setuptools shim
+# (distutils-precedence.pth) never ran and `import distutils` failed on the
+# overlay — the interpreter that actually runs ComfyUI. addsitedir processes
+# them, and still appends after the overlay's own site-packages, preserving
+# the overlay-shadows-baked precedence.
+write_baked_pth() {
+    local baked_site overlay_site
+    baked_site="$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+    overlay_site="$("$DATA_DIR/venv/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
+    printf 'import site; site.addsitedir(%s)\n' "'$baked_site'" > "$overlay_site/_baked_venv.pth"
+}
+
 OVERLAY_STATE="$(overlay_torch_state)"
 if overlay_state_ready "$OVERLAY_STATE"; then
     # Migration path: a venv built by an older entrypoint (before this
@@ -125,8 +139,17 @@ if overlay_state_ready "$OVERLAY_STATE"; then
     # correctly recognized as "this used to work", not misread as "never
     # finished".
     [ -e "$VENV_SENTINEL" ] || touch "$VENV_SENTINEL"
+    # Same migration idea for the .pth: rewrite the pre-import-form (plain
+    # path) file so distutils and any other .pth-dependent baked package
+    # work on the next interpreter start. Idempotent.
+    write_baked_pth
 else
-    if [ -e "$VENV_SENTINEL" ] && [ "$OVERLAY_STATE" = "no-cuda" ]; then
+    # No sentinel condition here: an overlay that imports torch may hold the
+    # user's packages regardless of whether the completion marker was ever
+    # written (a pre-sentinel-era venv has none), and step 2 already proved
+    # the GPU itself works — so no-cuda always means shadowing, never an
+    # unfinished build. The wipe below is reachable only for state=broken.
+    if [ "$OVERLAY_STATE" = "no-cuda" ]; then
         die "the overlay venv at $DATA_DIR/venv imports torch but cannot see a GPU, while the baked venv at /opt/venv can. Something installed into the overlay is shadowing baked torch with a CPU-only build — most likely ComfyUI-Manager or a custom node's requirements.txt. Find it with '$DATA_DIR/venv/bin/pip list --local | grep -i torch', then remove it ('$DATA_DIR/venv/bin/pip uninstall torch torchvision torchaudio') so the baked cu130 build shows through again. Refusing to delete the overlay automatically — your installed custom-node packages are on it. 'make down && make reset-venv && make up' rebuilds it from scratch (this permanently deletes every package installed there). Set COMFYUI_ALLOW_CPU=1 to run on the CPU anyway."
     fi
     if [ -e "$VENV_SENTINEL" ]; then
@@ -139,9 +162,7 @@ else
         log "creating the overlay venv at $DATA_DIR/venv"
     fi
     /opt/venv/bin/python -m venv "$DATA_DIR/venv"
-    BAKED_SITE="$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
-    OVERLAY_SITE="$("$DATA_DIR/venv/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
-    echo "$BAKED_SITE" > "$OVERLAY_SITE/_baked_venv.pth"
+    write_baked_pth
     overlay_state_ready "$(overlay_torch_state)" \
         || die "overlay venv at $DATA_DIR/venv still can't reach torch and the GPU after rebuilding it — check that /opt/venv itself has torch installed"
     touch "$VENV_SENTINEL"
@@ -172,6 +193,13 @@ fi
 MANAGER_DIR="$DATA_DIR/custom_nodes/ComfyUI-Manager"
 MANAGER_TMP="$DATA_DIR/.manager-clone.tmp"
 MANAGER_SENTINEL="$MANAGER_DIR/.manager-ready"
+
+# A rebuilt venv holds none of Manager's dependencies, so a sentinel written
+# against the OLD venv is stale — clear it, or a kill during the reinstall
+# below would leave a state every later start mistakes for complete.
+if [ "$VENV_REBUILT" = "1" ]; then
+    rm -f "$MANAGER_SENTINEL"
+fi
 
 # A checkout is complete iff git can resolve HEAD (an interrupted clone leaves
 # HEAD pointing at an unborn branch) and the working tree was written out.
@@ -303,7 +331,14 @@ if [ "${#MANAGER_CFGS[@]}" -eq 0 ]; then
     fi
 fi
 for cfg in "${MANAGER_CFGS[@]}"; do
-    if [ -n "$(seed_manager_pip_mode "$cfg")" ]; then
+    # The || die is load-bearing: a command substitution inside a test
+    # condition discards the function's exit status even under set -e, so a
+    # rewrite that failed (unreadable file, unwritable dir, ENOSPC) would
+    # otherwise leave use_uv=True in place silently — quietly disabling the
+    # central uv guard.
+    seed_out="$(seed_manager_pip_mode "$cfg")" \
+        || die "could not enforce use_uv = False in $cfg — Manager would fall back to uv, which cannot see the baked venv (spec §7.2). Fix or delete that file and start again."
+    if [ -n "$seed_out" ]; then
         log "set use_uv = False in $cfg (uv cannot see the baked venv; see spec §7.2)"
     fi
 done
@@ -331,8 +366,30 @@ if [ "${COMFYUI_SKIP_LAUNCH:-0}" = "1" ]; then
     exit 0
 fi
 
-# 8. Hand off. COMFYUI_ARGS is deliberately unquoted so it word-splits into
-#    separate flags.
+# 8. Hand off.
+#
+#    PATH/VIRTUAL_ENV: the image's ENV still points bare `python`/`pip` at the
+#    root-owned /opt/venv — so a custom node's install.py shelling out to
+#    plain `pip install`, or a user in `make shell`, would hit a
+#    PermissionError (or target the wrong env entirely). Re-point both at the
+#    overlay, which is what everything at runtime should mean by "the env".
+export VIRTUAL_ENV="$DATA_DIR/venv"
+export PATH="$DATA_DIR/venv/bin:$PATH"
+
+#    COMFYUI_ALLOW_CPU=1 must also pass --cpu: without it the pinned ComfyUI
+#    executes torch.cuda.current_device() unguarded at import and crash-loops
+#    on a GPU-less host — the override would bypass our guards only to die in
+#    ComfyUI's own. Appended after COMFYUI_ARGS; a duplicate --cpu is harmless.
+CPU_FLAG=""
+if [ "${COMFYUI_ALLOW_CPU:-0}" = "1" ]; then
+    CPU_FLAG="--cpu"
+fi
+
+#    COMFYUI_ARGS is deliberately unquoted so it word-splits into separate
+#    flags — but word-splitting also enables pathname expansion, and the cwd
+#    is /opt/comfyui, so a * or ? in the args would expand against ComfyUI's
+#    source tree. set -f keeps the splitting and turns the globbing off.
+set -f
 log "starting ComfyUI"
 # shellcheck disable=SC2086
 exec "$DATA_DIR/venv/bin/python" "$COMFYUI_HOME/main.py" \
@@ -340,4 +397,4 @@ exec "$DATA_DIR/venv/bin/python" "$COMFYUI_HOME/main.py" \
     --port 8188 \
     --base-directory "$DATA_DIR" \
     --disable-auto-launch \
-    ${COMFYUI_ARGS:-}
+    ${COMFYUI_ARGS:-} $CPU_FLAG
