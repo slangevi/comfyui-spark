@@ -24,13 +24,28 @@ services:
       - "127.0.0.1:${COMFYUI_PORT:-8188}:8188"
 
     volumes:
-      - "${COMFYUI_DATA_PATH}:/data"
+      # Defaulted, not bare: with an empty value compose fails on an
+      # unparseable mount spec rather than telling you .env is missing.
+      # Keep this default in step with the Makefile, scripts/fetch-model.sh
+      # and spec §7.7.
+      - "${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}:/data"
 
     environment:
       - COMFYUI_ARGS=${COMFYUI_ARGS:---highvram --use-pytorch-cross-attention}
       - COMFYUI_ALLOW_CPU=${COMFYUI_ALLOW_CPU:-0}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # Read by every custom node that runs in this container, not just by
+      # Manager's model downloader. Use a read-only, minimally-scoped token.
       - HF_TOKEN=${HF_TOKEN:-}
+      # Anything ComfyUI-Manager or a custom node's requirements.txt installs
+      # at runtime resolves against PyPI by default — including `torch`, which
+      # on PyPI is a generic build. Adding the cu130 index means a reinstall
+      # lands on the same aarch64 CUDA wheels the image was built with. It is
+      # a mitigation, not a guarantee (pip and uv still pick the highest
+      # version across both indexes); the entrypoint's pre-launch GPU
+      # assertion is what actually catches a bad one.
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
+      - UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
       # entrypoint.sh's MANAGER_REF is deliberately NOT exposed here. See
       # .env.example for why the ComfyUI-Manager pin stays compose-inert.
 
