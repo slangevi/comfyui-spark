@@ -26,7 +26,7 @@ verify: ## Run the full verification suite
 	./scripts/verify-persistence.sh
 	./scripts/verify-e2e.sh
 
-reset-venv: ## Delete the overlay venv; recreated on next start
+reset-venv: ## Delete the overlay venv (stop the service first); rebuilt on next start
 	@# .env is sourced with bash's own `.` here, scoped to this recipe only —
 	@# not a blanket `-include .env` / `export` at file scope. Make's
 	@# -include does not strip shell quoting, so a quoted value like

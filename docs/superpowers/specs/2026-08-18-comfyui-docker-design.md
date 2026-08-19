@@ -53,10 +53,17 @@ This is the single most important assumption in the design, so
    dependencies** — survive container restarts and image rebuilds.
 3. Model weights and generated outputs live on the host filesystem, readable
    and writable by `scott` without `docker cp` or `sudo`.
-4. Reproducible: every upstream input is pinned by tag or SHA, with a dated
-   comment, matching the convention in `sparkyard/llama-cpp/llama-cpp.Dockerfile`.
+4. Reproducible: every upstream input this project names is pinned by digest,
+   tag or SHA, with a dated comment, matching the convention in
+   `sparkyard/llama-cpp/llama-cpp.Dockerfile` — the base image (manifest
+   digest), the torch trio, the ComfyUI ref and the ComfyUI-Manager ref.
+   Transitive pip dependencies are **not** pinned: `pip install -r
+   requirements.txt` re-resolves them on every build, so two builds of the
+   same Dockerfile can differ in those. A constraints/lock file would close
+   that gap and is deliberately deferred (§11).
 5. A GPU misconfiguration fails loudly at startup rather than silently
-   degrading to CPU.
+   degrading to CPU — asserted on the interpreter that actually renders
+   (`/data/venv`), not only on the baked one (§7.6 steps 2 and 7).
 
 ## 4. Non-goals (v1)
 
@@ -105,6 +112,7 @@ This is the single most important assumption in the design, so
 │   └── entrypoint.sh
 ├── scripts/
 │   ├── verify-gpu.sh
+│   ├── verify-entrypoint.sh
 │   ├── verify-http.sh
 │   ├── verify-persistence.sh
 │   ├── verify-e2e.sh
@@ -190,6 +198,27 @@ The trade-off accepted here: debugging a version conflict means checking two
 `site-packages` layers. `make shell` and the README document
 `pip list --local` (overlay only) versus `pip list` (both) as the diagnostic.
 
+**The layering only works for tools that read `.pth` files.** pip does; `uv`
+does not. Measured in the running container through Manager's own
+`manager_util.get_installed_packages()`: in pip mode it finds 129 packages,
+including `torch`, `numpy`, `transformers`, `pillow` and `safetensors`; in uv
+mode it finds 27, and of those five it finds none. ComfyUI-Manager
+enables `uv` by default on Linux whenever it can import it — and `uv` is in
+Manager's own `requirements.txt` — so by default Manager believes ~100 baked
+packages are missing and reinstalls them (torch included) from PyPI into the
+overlay, where they shadow the GPU-correct baked copies. The entrypoint
+therefore forces `use_uv = False` in Manager's `config.ini` (§7.6 step 6). This
+is a property of the environment, not a user preference, so it is re-asserted
+on every start rather than seeded once at clone time; the edit is line-scoped
+and leaves every other key and section in that file untouched.
+
+The same shadowing can arrive by other routes — any custom node whose
+`requirements.txt` names `torch`, `numpy`, `transformers`, `pillow` or
+`safetensors` — so detection cannot rely on the `uv` fix alone. `PIP_EXTRA_INDEX_URL`
+and `UV_EXTRA_INDEX_URL` point at the cu130 index (§7.4) so that a reinstall
+that does happen at least resolves to the right build, and §7.6 step 7 asserts
+the outcome before ComfyUI is launched.
+
 ### 7.3 Persistence
 
 `/data` is a bind mount of `${COMFYUI_DATA_PATH}` (default
@@ -207,12 +236,26 @@ t2i_adapter  gligen  upscale_models  latent_upscale_models  hypernetworks
 photomaker  classifiers
 ```
 
-ComfyUI-Manager is cloned into `/data/custom_nodes/ComfyUI-Manager` on first
+ComfyUI-Manager is installed into `/data/custom_nodes/ComfyUI-Manager` on first
 start **only if absent**, pinned to `d5992a11` (`main`, 2026-08-18). Manager's
 own release tags are abandoned — the newest, `4.2.2`, is from 2026-06-14 and
 `main` is 911 commits ahead — so a SHA on `main` is the reproducible choice. The
 pin governs the initial clone only; thereafter the user updates Manager from the
 UI and the entrypoint leaves it alone.
+
+The install is three steps that must all complete — clone, checkout the pin,
+install requirements into the overlay venv — and a container killed partway
+through must not leave a state the next start mistakes for "done": a kill
+between clone and checkout would silently defeat the pin, and a kill during the
+requirements install would leave Manager with none of its dependencies. So it
+is made crash-safe the same way the overlay venv is. Clone into a scratch
+directory outside `custom_nodes/` (ComfyUI imports every directory it finds
+there), checkout, then `mv` into place — an atomic rename on one filesystem, so
+the published checkout is either absent or complete and pinned. Write a
+`.manager-ready` sentinel only after the requirements install returns 0. A
+start that finds no sentinel redoes the requirements install, and re-clones
+only if git cannot resolve `HEAD` in the existing checkout — a complete
+checkout, including one the user has updated from the UI, is never deleted.
 
 ### 7.4 Service definition
 
@@ -231,11 +274,14 @@ services:
       memlock: -1                  # unified memory needs unlimited locked pages
       stack: 67108864
     ports: ["127.0.0.1:${COMFYUI_PORT:-8188}:8188"]
-    volumes: ["${COMFYUI_DATA_PATH}:/data"]
+    volumes: ["${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}:/data"]
     environment:
       - COMFYUI_ARGS=${COMFYUI_ARGS:---highvram --use-pytorch-cross-attention}
+      - COMFYUI_ALLOW_CPU=${COMFYUI_ALLOW_CPU:-0}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - HF_TOKEN=${HF_TOKEN:-}
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
+      - UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
     deploy:
       resources:
         reservations:
@@ -249,7 +295,19 @@ services:
 ```
 
 The `ipc`, `security_opt`, and `ulimits` settings are carried over from the
-working GB10 configuration in `sparkyard/docker-compose.yml`.
+working GB10 configuration in `sparkyard/docker-compose.yml`. Two of them
+widen the blast radius of the custom-node code this service exists to run:
+`seccomp:unconfined` removes the default syscall filter, and `ipc: host` shares
+the host IPC namespace with the other GPU containers on this machine. They are
+kept because the GPU path is unreliable without them; the README's security
+section states the trade-off rather than leaving it in a compose comment.
+
+`COMFYUI_DATA_PATH` carries its default here as well as in the Makefile and
+`fetch-model.sh`, so `make up` without a `.env` starts correctly instead of
+failing on an empty bind-mount spec.
+
+`HF_TOKEN` is injected into the container deliberately (Manager's model
+downloader reads it), which also exposes it to every custom node — see §7.7.
 
 Port 8188 is free: the host currently listens on 22, 53, 631, 3000, 11000,
 11434, 14000, 19000, and 28080.
@@ -270,16 +328,40 @@ All are overridable via `COMFYUI_ARGS` in `.env` without rebuilding.
 In order, failing fast with a distinct message at each step:
 
 1. Assert `/data` exists and is writable → else exit 1.
-2. Assert an NVIDIA device is visible, unless `COMFYUI_ALLOW_CPU=1` → else exit 1.
+2. Assert `/opt/venv`'s torch sees a CUDA device, unless `COMFYUI_ALLOW_CPU=1`
+   → else exit 1.
 3. `mkdir -p` the `/data` tree from §7.3.
 4. Create `/data/venv` if absent, linked to `/opt/venv`'s site-packages via
-   `.pth` file (§7.2).
-5. Clone pinned ComfyUI-Manager into `/data/custom_nodes/` if absent.
-6. `exec /data/venv/bin/python /opt/comfyui/main.py --listen 0.0.0.0 --port 8188
+   `.pth` file (§7.2). Readiness of an existing overlay means "torch imports
+   **and** reaches the GPU"; a `no-cuda` overlay is never auto-rebuilt (the
+   user's packages are on it), it is refused with the shadowing message. Under
+   `COMFYUI_ALLOW_CPU=1` a working `import torch` is the whole readiness test,
+   so a deliberate CPU start neither rebuilds nor refuses.
+5. Install pinned ComfyUI-Manager into `/data/custom_nodes/` if absent, and
+   (re)install its requirements whenever either the overlay venv or the
+   Manager install did not previously complete (§7.3).
+6. Force `use_uv = False` in Manager's `config.ini`, creating the file if
+   absent and leaving every other setting in it alone (§7.2).
+7. Assert `/data/venv`'s torch sees a CUDA device, unless
+   `COMFYUI_ALLOW_CPU=1` → else exit 1, naming overlay shadowing as the likely
+   cause and giving the two recoveries (uninstall the overlay copy, or
+   `make reset-venv`).
+8. `exec /data/venv/bin/python /opt/comfyui/main.py --listen 0.0.0.0 --port 8188
    --base-directory /data --disable-auto-launch ${COMFYUI_ARGS}`
 
 Step 2 exists because the worst failure mode is not a crash — it is ComfyUI
 silently running on CPU and the user discovering it forty minutes into a render.
+
+Step 7 exists because step 2 alone does not deliver that guarantee: it
+interrogates `/opt/venv`, and ComfyUI runs on `/data/venv`, whose site-packages
+comes first on `sys.path`. Everything between the two steps writes to that
+overlay. Step 2 is kept anyway — it is the cheapest, earliest signal, it runs
+before the multi-minute venv build, and "no GPU in this container at all" and
+"the interpreter that renders cannot see the GPU" need different remedies.
+
+`COMFYUI_SKIP_LAUNCH=1` stops after step 7 instead of exec'ing; it is the seam
+`verify-entrypoint.sh` uses to test the startup contract without a server that
+never exits.
 
 ### 7.7 Configuration surface
 
@@ -291,8 +373,9 @@ silently running on CPU and the user discovering it forty minutes into a render.
 | `COMFYUI_PORT` | `8188` | Host port, bound to `127.0.0.1` only |
 | `COMFYUI_ARGS` | `--highvram --use-pytorch-cross-attention` | Appended to the `main.py` command line |
 | `PUID` / `PGID` | `1000` / `1000` | Container user, so `/data` files are owned by `scott` |
-| `HF_TOKEN` | empty | Optional; read only by `fetch-model.sh` for gated repos |
-| `COMFYUI_ALLOW_CPU` | unset | Set to `1` to bypass the entrypoint's GPU assertion |
+| `HF_TOKEN` | empty | Optional, for gated repos. Read by `fetch-model.sh` on the host **and** injected into the container, where Manager's downloader and `huggingface-hub` use it — so every custom node can read it. Use a read-only, minimally-scoped token |
+| `COMFYUI_ALLOW_CPU` | unset | Set to `1` to bypass both of the entrypoint's GPU assertions |
+| `COMFYUI_SKIP_LAUNCH` | unset | Set to `1` to run the entrypoint's preparation and stop before launching ComfyUI. Testing seam for `verify-entrypoint.sh`; not exposed in `docker-compose.yml` |
 
 ### 7.8 Makefile targets
 
@@ -317,10 +400,10 @@ Written before the implementation, per TDD. Each is a standalone script;
 
 | Script | Asserts |
 |---|---|
-| `verify-gpu.sh` | Inside the container: `torch.cuda.is_available()`, device name contains `GB10`, capability `(12, 1)`, and a bf16 matmul returns finite values |
-| `verify-entrypoint.sh` | The six §7.6 startup behaviors: `/data` seeded, overlay venv created, Manager cloned once and not re-cloned, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused |
+| `verify-gpu.sh` | The same assertion against **both** interpreters — `torch.cuda.is_available()`, device name contains `GB10`, capability `(12, 1)`, a bf16 matmul returns finite values: on `/opt/venv` in the image (the only check a freshly built image can make), and on `/data/venv` in the **running** container, which is the one that renders. Skips the second only when no overlay venv exists yet |
+| `verify-entrypoint.sh` | The §7.6 startup contract against a throwaway `/data`, in 13 cases: the six documented behaviors (`/data` seeded, overlay venv created, Manager installed once and not re-installed, GPU guard trips with no device, `COMFYUI_ALLOW_CPU=1` bypasses it, unwritable `/data` refused), plus the recovery paths — interrupted venv build rebuilt, previously-working venv refused rather than wiped, Manager requirements reinstalled after a venv rebuild, `reset-venv` recovery, a clone killed in flight self-healing to the pinned ref, an interrupted requirements install reinstalled without re-cloning, `use_uv = False` seeded and repaired, and an overlay venv that cannot reach the GPU refused both before and after the readiness check |
 | `verify-http.sh` | `GET /system_stats` returns 200 and lists a CUDA device |
-| `verify-persistence.sh` | `pip install six` (tiny, pure-Python, and not a ComfyUI dependency, so it can only have come from the overlay) into `/data/venv`, `docker compose up -d --force-recreate`, then assert it is still importable **and** still reported by `pip list --local` |
+| `verify-persistence.sh` | `pip install pyjokes` (tiny, pure-Python, dependency-free, and nothing in the ML stack can drag it in) into `/data/venv`, `docker compose up -d --force-recreate`, then assert it is still importable **and** still reported by `pip list --local`. Never uninstalls a package it did not install: the probe is skipped if already present, and the cleanup trap reports rather than silently no-ops when it cannot reach the container |
 | `verify-e2e.sh` | `POST /prompt` with a minimal workflow, poll `/history`, assert a PNG appears in `/data/output`. Skips with an explicit message when no checkpoint is installed |
 
 `verify-persistence.sh` is the one that would have caught the naive design, so it
@@ -338,7 +421,9 @@ to prove.
 |---|---|---|
 | No GPU visible to container | Entrypoint step 2 | Exit 1 with remediation message; `COMFYUI_ALLOW_CPU=1` to override |
 | `/data` not writable | Entrypoint step 1 | Exit 1 naming the path and expected UID |
-| Overlay venv corrupted | ComfyUI fails to start | `make reset-venv` deletes `/data/venv`; recreated on next start |
+| Overlay venv corrupted | Entrypoint step 4 | Refuses to start if it previously worked (the user's packages are on it); `make reset-venv` deletes `/data/venv`, recreated on next start |
+| Overlay torch shadows baked torch with a CPU-only build | Entrypoint steps 4 and 7; `verify-gpu.sh` against the running container | Exit 1 naming the shadowing cause; uninstall the overlay copy, or `make reset-venv` |
+| Manager clone or requirements install interrupted | Entrypoint step 5 (`.manager-ready` absent) | Redone on the next start: scratch clone discarded, requirements reinstalled; a complete checkout is never deleted |
 | Custom node breaks startup | Container restart loop | README documents `--disable-all-custom-nodes` via `COMFYUI_ARGS` |
 | Web UI unreachable | Healthcheck | Container marked unhealthy after 3 × 30 s past a 120 s grace period |
 
@@ -357,7 +442,9 @@ to prove.
 
 ## 11. Future work
 
-Explicitly deferred, in rough priority order: SageAttention or Flash-Attention
-kernels built for sm_121 if SDPA proves slow; a `fetch-model.sh` catalogue with
-checksums; optional Caddy reverse proxy with basic auth for LAN access; and
+Explicitly deferred, in rough priority order: a pip constraints/lock file for
+the transitive dependencies of ComfyUI's and Manager's `requirements.txt`, so
+that a rebuild is reproducible all the way down (goal 4); SageAttention or
+Flash-Attention kernels built for sm_121 if SDPA proves slow; a
+`fetch-model.sh` catalogue with checksums; optional Caddy reverse proxy with basic auth for LAN access; and
 folding the service into `sparkyard` if the two stacks come to share models.

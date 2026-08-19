@@ -10,8 +10,8 @@ Design: `docs/superpowers/specs/2026-08-18-comfyui-docker-design.md`
 ## Quickstart
 
 ```bash
-cp .env.example .env          # adjust COMFYUI_DATA_PATH if needed
-mkdir -p /home/scott/LLMs/comfyui
+cp .env.example .env                 # adjust COMFYUI_DATA_PATH if needed
+mkdir -p /home/scott/LLMs/comfyui    # ...or whatever you set it to
 make build
 make up
 make verify
@@ -19,8 +19,18 @@ make verify
 
 Then open <http://127.0.0.1:8188>.
 
-The first start takes a few minutes: it creates the overlay venv and clones
-ComfyUI-Manager. Later starts are quick.
+What to expect the first time:
+
+- `make build` downloads roughly 5.5 GB (the CUDA base image plus ~3 GB of
+  torch wheels) and takes on the order of ten minutes. The finished image
+  occupies about 15 GB unpacked — `docker images` reports both numbers.
+- The first `make up` takes a few minutes before the UI answers: it creates
+  the overlay venv and clones ComfyUI-Manager. Later starts are quick. Let it
+  finish — interrupting it is handled (the entrypoint redoes anything it
+  finds half-done), but you will just wait again next time.
+- `make verify` **force-recreates the running container** as part of the
+  persistence test, which interrupts any generation in flight. Run it when
+  the machine is idle.
 
 ## Getting models
 
@@ -82,6 +92,18 @@ Run `make` on its own for the full list. The common ones: `build`, `up`,
   UI — and their pip dependencies — are still there tomorrow, while a fresh
   `docker compose build` only ever touches `/opt/venv`.
 
+  One consequence is worth knowing about: **ComfyUI-Manager is pinned to pip,
+  not `uv`**. Manager prefers `uv` on Linux whenever it can import it, and it
+  can — `uv` is in Manager's own `requirements.txt`. But `uv` does not read
+  `.pth` files, so inside `/data/venv` it sees only the overlay's own 27
+  packages, not the ~100 baked ones. Manager decides what a node still
+  needs from that list, so under `uv` it would reinstall torch, numpy,
+  transformers and friends from PyPI into the overlay, where they shadow the
+  GPU-correct baked copies. The entrypoint therefore writes
+  `use_uv = False` into `user/__manager/config.ini` on every start (leaving
+  every other setting in that file alone). Installs are slower and correct
+  rather than fast and wrong.
+
 ## Troubleshooting
 
 **Which layer is a package in?**
@@ -116,8 +138,36 @@ already unhealthy. Back up `$COMFYUI_DATA_PATH/venv` first if that's you.
 
 **It seems slow — is it actually on the GPU?** `./scripts/verify-gpu.sh`, or
 check `curl -s localhost:8188/system_stats | python3 -m json.tool`. The
-entrypoint refuses to start without a GPU, so a CPU fallback should be
-impossible; if you hit one, that is a bug worth reporting.
+entrypoint checks both Python layers before it launches — the baked venv and
+the overlay venv that actually renders — and refuses to start if either
+cannot reach the GPU, so a silent CPU fallback at startup should be
+impossible.
+
+The gap it cannot close is a change made *while the service is up*: install a
+custom node whose `requirements.txt` names `torch` and Manager may put a
+CPU-only build into `/data/venv`, where it shadows the baked one. Nothing
+changes until the next restart — and that restart then refuses to start, with
+a message naming overlay shadowing as the likely cause and telling you where
+to look. To fix it:
+
+```bash
+docker compose exec comfyui /data/venv/bin/pip list --local | grep -i torch
+docker compose exec comfyui /data/venv/bin/pip uninstall torch torchvision torchaudio
+make down && make up
+```
+
+Uninstalling the overlay copy lets the baked `cu130` build show through
+again. If that is not enough, `make down && make reset-venv && make up`
+rebuilds the overlay from scratch (and discards every Manager-installed
+package). `make verify` runs `verify-gpu.sh` against the live container, so a
+routine verification catches this too.
+
+**The overlay venv refuses to start after an image rebuild.** If the base
+image's Python minor version changed (3.12 → 3.13), `/data/venv`'s paths no
+longer match the interpreter that created it and `import torch` breaks. The
+entrypoint refuses to start rather than delete it. The recovery is
+`make down && make reset-venv && make up`; the custom nodes themselves are
+untouched, so reinstall their requirements from the Manager UI afterwards.
 
 **`sm_121` is missing from `torch.cuda.get_arch_list()`.** Expected, not a
 fault. PyTorch's cu130 build ships cubins up to `sm_120`; the GB10's compute
@@ -137,3 +187,28 @@ effective code execution. Reach it from another machine with an SSH tunnel:
 ```bash
 ssh -L 8188:127.0.0.1:8188 scott@<this-host>
 ```
+
+Three consequences of that "custom nodes execute arbitrary Python" line are
+worth stating plainly, because they are all deliberate trade-offs:
+
+- **`HF_TOKEN` is injected into the container** (`docker-compose.yml`), not
+  only used by `scripts/fetch-model.sh` on the host — Manager's model
+  downloader needs it for gated repos, and `huggingface-hub` picks it up from
+  the environment automatically. That means **every custom node you install
+  can read it and send it anywhere**. Use a read-only token, scoped to the
+  fewest repositories that work, and rotate it if you install nodes you have
+  not read.
+- **`seccomp:unconfined`** (`docker-compose.yml`) is carried over from the
+  working GB10 configuration in `sparkyard`: the CUDA userspace driver makes
+  ioctl and memory calls that Docker's default seccomp profile blocks on this
+  platform. It is kept because the GPU does not work reliably without it, but
+  it materially weakens the kernel-attack-surface reduction that normally
+  stands between a hostile custom node and a container escape.
+- **`ipc: host`** (`docker-compose.yml`, same origin) puts the container in
+  the host IPC namespace so CUDA can share memory with the driver. That
+  namespace is shared with the other GPU containers on this machine, so a
+  hostile node is not isolated from their shared-memory segments either.
+
+Net: treat installing a custom node as running unreviewed code as your user,
+not as running it in a sandbox. `--disable-all-custom-nodes` in
+`COMFYUI_ARGS` is the off switch.
