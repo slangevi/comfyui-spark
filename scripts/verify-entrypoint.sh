@@ -47,19 +47,74 @@ if docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 \
 fi
 echo "    refused to start with an unwritable /data"
 
-# Case 7 — an interrupted first boot (venv created, .pth not yet written)
-# must self-heal on the next start rather than hand off to a broken
-# interpreter. Simulate the interruption by deleting the .pth Case 1 already
-# wrote, out from under an otherwise-intact venv.
-PTH="$(find "$TMP/venv" -name '_baked_venv.pth')"
-[ -n "$PTH" ] || { echo "FAIL: expected an existing _baked_venv.pth from Case 1 before simulating an interrupted boot" >&2; exit 1; }
-rm -f "$PTH"
+overlay_pth() { find "$TMP/venv" -name '_baked_venv.pth'; }
+overlay_sentinel() { find "$TMP/venv" -name '.overlay-venv-built'; }
+
+# Case 7 — sentinel absent + broken import: the venv never finished its
+# first build, so it must be rebuilt automatically.
+SENTINEL="$(overlay_sentinel)"
+[ -n "$SENTINEL" ] || { echo "FAIL: expected an existing .overlay-venv-built sentinel from Case 1" >&2; exit 1; }
+PTH="$(overlay_pth)"
+[ -n "$PTH" ] || { echo "FAIL: expected an existing _baked_venv.pth from Case 1" >&2; exit 1; }
+rm -f "$SENTINEL" "$PTH"
 if docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
         -c 'import torch' >/dev/null 2>&1; then
     echo "FAIL: overlay venv still imported torch after removing its .pth — test setup is invalid" >&2; exit 1
 fi
 docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 -v "$TMP:/data" "$IMAGE" >/dev/null
 docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
-    -c 'import torch; print("    overlay venv self-healed after a simulated interrupted boot, torch", torch.__version__)'
+    -c 'import torch; print("    sentinel-absent + broken venv: rebuilt automatically, torch", torch.__version__)'
+[ -n "$(overlay_sentinel)" ] || { echo "FAIL: rebuild did not (re)write the completion sentinel" >&2; exit 1; }
+
+# Case 8 — sentinel present + broken import: a previously-working venv must
+# NOT be silently wiped. It must refuse to start, and the user's own
+# overlay-installed package must still be importable afterward.
+#
+# The installed file's path is resolved through the interpreter itself
+# (six.__file__), not a bare `find -name six.py`: pip vendors its own copies
+# of six under pip/_vendor/, so a name-based find matches multiple files and
+# would make the survival check meaningless.
+docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/pip "$IMAGE" \
+    install --no-cache-dir six >/dev/null
+SIX_CONTAINER_PATH="$(docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+    -c 'import six; print(six.__file__)')"
+[ -n "$SIX_CONTAINER_PATH" ] || { echo "FAIL: six did not install into the overlay venv — test setup is invalid" >&2; exit 1; }
+SIX_FILE="$TMP${SIX_CONTAINER_PATH#/data}"
+[ -e "$SIX_FILE" ] || { echo "FAIL: could not map installed six.py ($SIX_CONTAINER_PATH) onto the host bind mount ($SIX_FILE) — test setup is invalid" >&2; exit 1; }
+PTH="$(overlay_pth)"
+[ -n "$PTH" ] || { echo "FAIL: expected an existing _baked_venv.pth before breaking the venv again" >&2; exit 1; }
+rm -f "$PTH"
+if docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+        -c 'import torch' >/dev/null 2>&1; then
+    echo "FAIL: overlay venv still imported torch after removing its .pth — test setup is invalid" >&2; exit 1
+fi
+if docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 -v "$TMP:/data" "$IMAGE" >/dev/null 2>&1; then
+    echo "FAIL: a previously-working venv was silently rebuilt instead of refusing to start" >&2; exit 1
+fi
+[ -e "$SIX_FILE" ] || { echo "FAIL: the user's overlay package (six) was deleted by a refused start" >&2; exit 1; }
+[ -n "$(overlay_sentinel)" ] || { echo "FAIL: the sentinel itself was deleted by a refused start" >&2; exit 1; }
+echo "    sentinel-present + broken venv: refused to start, overlay package survived on disk"
+
+# Case 9 — rebuilding the venv while a Manager checkout already exists must
+# reinstall Manager's requirements, not just leave a Manager-free venv.
+# `toml` is one of Manager's requirements.txt entries and is absent from the
+# baked /opt/venv, so its presence afterward can only come from a reinstall.
+rm -f "$(overlay_sentinel)"
+docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 -v "$TMP:/data" "$IMAGE" >/dev/null
+docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+    -c 'import toml; print("    venv rebuilt with an existing Manager checkout: its requirements were reinstalled")'
+
+# Case 10 — `make reset-venv` (spec §9: `rm -rf /data/venv` wholesale) must
+# recover cleanly. This deletes the sentinel along with everything else, so
+# the next start sees a completely absent venv (not merely a broken one) —
+# distinct from Case 7's "leftover files from an interrupted build" shape.
+# It must build fresh, succeed, and reinstall Manager's requirements again
+# since the checkout is still on disk.
+rm -rf "$TMP/venv"
+[ ! -e "$TMP/venv" ] || { echo "FAIL: test setup could not remove \$TMP/venv" >&2; exit 1; }
+docker run --rm --gpus all -e COMFYUI_SKIP_LAUNCH=1 -v "$TMP:/data" "$IMAGE" >/dev/null
+docker run --rm --gpus all -v "$TMP:/data" --entrypoint /data/venv/bin/python "$IMAGE" \
+    -c 'import torch, toml; print("    make reset-venv equivalent (whole-directory delete): rebuilt cleanly, Manager reqs reinstalled")'
+[ -n "$(overlay_sentinel)" ] || { echo "FAIL: reset-venv recovery did not write a fresh completion sentinel" >&2; exit 1; }
 
 echo "==> verify-entrypoint: PASS"
