@@ -1,0 +1,52 @@
+# ComfyUI on DGX Spark (GB10). See docs/superpowers/specs/ for the design.
+services:
+  comfyui:
+    build:
+      context: .
+      args:
+        PUID: "${PUID:-1000}"
+        PGID: "${PGID:-1000}"
+    image: comfyui-spark:latest
+    container_name: comfyui
+    restart: unless-stopped
+
+    # These four settings are carried over from the working GB10
+    # configuration in sparkyard/docker-compose.yml.
+    ipc: host                       # shared memory with the GPU driver
+    security_opt:
+      - seccomp:unconfined          # low-level CUDA calls
+    ulimits:
+      memlock: -1                   # unified memory needs unlimited locked pages
+      stack: 67108864
+
+    # 127.0.0.1 only — ComfyUI has no authentication.
+    ports:
+      - "127.0.0.1:${COMFYUI_PORT:-8188}:8188"
+
+    volumes:
+      - "${COMFYUI_DATA_PATH}:/data"
+
+    environment:
+      - COMFYUI_ARGS=${COMFYUI_ARGS:---highvram --use-pytorch-cross-attention}
+      - COMFYUI_ALLOW_CPU=${COMFYUI_ALLOW_CPU:-0}
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Empty by default, so entrypoint.sh's own pinned-commit default wins.
+      # See .env.example for why this exists and when it is safe to set.
+      - MANAGER_REF=${MANAGER_REF:-}
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8188/system_stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Generous: a cold first start clones the Manager and builds the venv.
+      start_period: 120s
