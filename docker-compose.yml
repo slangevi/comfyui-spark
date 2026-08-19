@@ -31,9 +31,8 @@ services:
       - COMFYUI_ALLOW_CPU=${COMFYUI_ALLOW_CPU:-0}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - HF_TOKEN=${HF_TOKEN:-}
-      # Empty by default, so entrypoint.sh's own pinned-commit default wins.
-      # See .env.example for why this exists and when it is safe to set.
-      - MANAGER_REF=${MANAGER_REF:-}
+      # entrypoint.sh's MANAGER_REF is deliberately NOT exposed here. See
+      # .env.example for why the ComfyUI-Manager pin stays compose-inert.
 
     deploy:
       resources:

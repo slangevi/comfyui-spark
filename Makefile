@@ -1,16 +1,6 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
-# Load .env (if present) into Make's variables *and* export them to every
-# recipe's shell. Without this, a target like reset-venv that reads
-# $$COMFYUI_DATA_PATH would silently fall back to its hardcoded default
-# whenever the value only lives in .env and was never exported by hand —
-# quietly deleting (or failing to delete) the wrong directory. docker
-# compose already reads .env on its own; this just gives `make` the same
-# view of it.
--include .env
-export
-
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-16s %s\n", $$1, $$2}'
 
@@ -37,8 +27,16 @@ verify: ## Run the full verification suite
 	./scripts/verify-e2e.sh
 
 reset-venv: ## Delete the overlay venv; recreated on next start
-	@echo "Removing $${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}/venv"
-	rm -rf "$${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}/venv"
+	@# .env is sourced with bash's own `.` here, scoped to this recipe only —
+	@# not a blanket `-include .env` / `export` at file scope. Make's
+	@# -include does not strip shell quoting, so a quoted value like
+	@# COMFYUI_ARGS="..." would reach every recipe's environment (and then
+	@# `docker compose`, via its env-precedence-over-.env rule) with the
+	@# literal quote characters still attached, corrupting it. `set -a` /
+	@# `set +a` exports only for the duration of this one shell invocation.
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	 echo "Removing $${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}/venv"; \
+	 rm -rf "$${COMFYUI_DATA_PATH:-/home/scott/LLMs/comfyui}/venv"
 
 update-comfyui: ## Print the newest upstream tag and SHA to pin
 	@tag=$$(git ls-remote --tags --refs https://github.com/Comfy-Org/ComfyUI.git \
