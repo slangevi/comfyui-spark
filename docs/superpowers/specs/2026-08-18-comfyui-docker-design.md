@@ -109,6 +109,8 @@ This is the single most important assumption in the design, so
 │   ├── verify-persistence.sh
 │   ├── verify-e2e.sh
 │   └── fetch-model.sh
+├── workflows/
+│   └── minimal-txt2img.json  # the graph verify-e2e.sh submits
 └── docs/superpowers/specs/2026-08-18-comfyui-docker-design.md
 ```
 

@@ -35,8 +35,9 @@ fi
 docker compose exec -T comfyui /data/venv/bin/pip install --no-cache-dir -q "$PKG"
 echo "    installed $PKG into the overlay venv"
 
-# It must live in the OVERLAY layer, not the baked one. --local excludes
-# packages inherited via --system-site-packages.
+# It must live in the OVERLAY layer, not the baked one. `pip list --local`
+# filters by path against sys.prefix, so it excludes packages reached only
+# via the _baked_venv.pth file too.
 if ! docker compose exec -T comfyui /data/venv/bin/pip list --local 2>/dev/null \
         | awk '{print tolower($1)}' | grep -qx "$PKG"; then
     echo "FAIL: $PKG is not in the overlay layer — 'pip list --local' does not list it." >&2
