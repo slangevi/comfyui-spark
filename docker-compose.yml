@@ -10,6 +10,16 @@ services:
     container_name: comfyui
     restart: unless-stopped
 
+    # The pinned ComfyUI registers no SIGTERM handler, and an unhandled
+    # signal is IGNORED by PID 1 — so docker's default stop was a 10s hang
+    # followed by SIGKILL, truncating any image mid-write. SIGINT is the
+    # signal Python always handles (KeyboardInterrupt -> clean shutdown);
+    # init:true additionally reaps zombies from custom nodes spawning
+    # subprocesses and forwards signals to the python child.
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+
     # These four settings are carried over from the working GB10
     # configuration in sparkyard/docker-compose.yml.
     ipc: host                       # shared memory with the GPU driver
@@ -39,11 +49,12 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       # Anything ComfyUI-Manager or a custom node's requirements.txt installs
       # at runtime resolves against PyPI by default — including `torch`, which
-      # on PyPI is a generic build. Adding the cu130 index means a reinstall
-      # lands on the same aarch64 CUDA wheels the image was built with. It is
-      # a mitigation, not a guarantee (pip and uv still pick the highest
-      # version across both indexes); the entrypoint's pre-launch GPU
-      # assertion is what actually catches a bad one.
+      # on PyPI is a generic build. The cu130 extra index makes a reinstall
+      # land on the same aarch64 CUDA wheels the image was built with, and the
+      # image's baked PIP_CONSTRAINT/UV_CONSTRAINT (/opt/constraints.txt) pins
+      # the torch trio to those exact builds — so a wrong-build install fails
+      # loudly instead of silently shadowing. The entrypoint's pre-launch GPU
+      # assertion remains the backstop.
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
       - UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
       # entrypoint.sh's MANAGER_REF is deliberately NOT exposed here. See
@@ -58,9 +69,15 @@ services:
               capabilities: [gpu]
 
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8188/system_stats"]
+      # Not just HTTP 200: /system_stats answers 200 even when ComfyUI is
+      # rendering on the CPU — the design's stated worst case. Requiring the
+      # primary device to be CUDA means even a Manager in-UI restart (which
+      # bypasses the entrypoint via os.execv) flips the container unhealthy
+      # within ~retries*interval instead of staying green indefinitely.
+      test: ["CMD", "python3", "-c", "import json,os,sys,urllib.request; d=json.load(urllib.request.urlopen('http://localhost:8188/system_stats', timeout=8)); sys.exit(0 if (os.environ.get('COMFYUI_ALLOW_CPU')=='1' or (d['devices'] and d['devices'][0]['type']=='cuda')) else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      # Generous: a cold first start clones the Manager and builds the venv.
-      start_period: 120s
+      # Above the 240s cold-start budget verify-http.sh already allows: a
+      # first boot builds the overlay venv and clones + installs Manager.
+      start_period: 300s
