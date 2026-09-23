@@ -58,6 +58,16 @@ RUN set -eux; \
         useradd -u "${PUID}" -g "${PGID}" -m -d /home/comfy comfy; \
     fi
 
+# PyTorch 2.13 implements some ops (torch._native, e.g. bmm_outer_product) as
+# Triton kernels, and Triton compiles a small C launcher stub on first use,
+# against the Python headers. Without gcc + python3-dev every modern text
+# encoder (Qwen3, Qwen3-VL, Gemma) fails at CLIPTextEncode with "Failed to
+# find C compiler". SD 1.5's CLIP never takes that path, which is why the
+# e2e check passed without this. Sits below torch so the 3 GB layer stays cached.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # ComfyUI lives in the image, never on the bind mount, so an upgrade is a
 # rebuild and can never leave a half-updated working tree on disk.
 RUN git clone --filter=blob:none https://github.com/Comfy-Org/ComfyUI.git /opt/comfyui \
