@@ -20,6 +20,7 @@ shell: ## Interactive shell in the running container
 	docker compose exec comfyui bash
 
 verify: ## Run the full verification suite
+	./scripts/verify-workflows.sh
 	./scripts/verify-gpu.sh
 	./scripts/verify-entrypoint.sh
 	./scripts/verify-http.sh

@@ -1,0 +1,15 @@
+{
+  "description": "Qwen-Image 2.1 single-image edit. `image` is a filename in ComfyUI's input directory — upload with `comfy upload FILE` first and refer to the image as <image1> in the prompt. Output size follows the input image.",
+  "tags": ["edit", "default"],
+  "params": {
+    "image":      { "path": "470.inputs.image",                "type": "string", "required": true },
+    "prompt":     { "path": "459:474.inputs.prompt",           "type": "string", "required": true },
+    "negative":   { "path": "459:474.inputs.negative_prompt",  "type": "string", "default": "" },
+    "seed":       { "path": "459:458.inputs.seed",             "type": "int",    "default": "random" },
+    "steps":      { "path": "459:458.inputs.steps",            "type": "int",    "default": 25 },
+    "cfg":        { "path": "459:458.inputs.cfg",              "type": "float",  "default": 1 },
+    "model":      { "path": "459:451.inputs.unet_name",        "type": "model",  "folder": "diffusion_models" },
+    "encoder":    { "path": "459:453.inputs.clip_name",        "type": "model",  "folder": "text_encoders" },
+    "prefix":     { "path": "461.inputs.filename_prefix",      "type": "string", "default": "qwen-image-2.1-edit" }
+  }
+}

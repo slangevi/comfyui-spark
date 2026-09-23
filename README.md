@@ -83,6 +83,60 @@ input, with `tags` selecting which workflow `comfy txt2img` and `comfy video`
 reach for. Types are injected as real JSON types: `int` matters, because
 ComfyUI rejects `"42"` where it wants `42`.
 
+## Workflow library
+
+`workflows/` holds API-format graphs plus their manifests. `sandbox-env` mounts
+this directory into agent sandboxes read-only; each `<name>.json` is runnable
+with `comfy run <name>`, and `tags` decide which one `comfy txt2img`,
+`comfy edit` (via `run`) and `comfy video` reach for. Exactly one manifest per
+tag may carry `default` — `make verify` enforces that, because two defaults
+make the helper silently pick whichever sorts first.
+
+| Workflow | Tags | Model | Warm | Reload | Notes |
+|---|---|---|---|---|---|
+| `z-image-turbo` | `txt2img`, **default** | Z-Image Turbo 6B — NVFP4 transformer + FP8-mixed encoder | ~6 s | ~60 s | 8 steps, cfg 1. `--set model=z_image_turbo_bf16.safetensors --set encoder=qwen_3_4b.safetensors` swaps to bf16 (~9 s warm, ~2x the reload) |
+| `qwen-image-2.1-t2i` | `txt2img` | Qwen-Image 2.1 7B, int8 | ~23 s | ~120 s | Best text rendering; size from `aspect` + `megapixels`, or literal `width`/`height` |
+| `qwen-image-2.1-edit` | `edit`, **default** | Qwen-Image 2.1 7B, int8 | ~30 s | ~120 s | Single image: `comfy upload FILE`, then `--set image=FILE --set prompt="... <image1> ..."` |
+| `ltx-2.5-t2v` | `video`, **default** | LTX-2.5 22B distilled, int8 + Gemma-4 12B | ~78 s | ~220 s | 5 s @ 24 fps, 1280x704, **with audio**. `duration`, `fps`, `aspect`, `megapixels`, `enhance` |
+| `minimal-txt2img` | `txt2img` | SD 1.5 | ~2 s | ~15 s | The original smoke-test workflow |
+
+Timings are from a GB10 at the manifests' defaults. **Warm** is a second
+run of the same workflow with a fresh seed; **reload** is the first run after
+a *different* model family has executed — ComfyUI reloads each family from
+disk on every switch, even with `--highvram`, so agents should batch
+generations by model. A re-run with an *identical* seed returns in ~2 s
+because ComfyUI's node cache short-circuits it; that is not a generation.
+
+Fetch everything the library needs (idempotent, ~90 GB on disk):
+
+```bash
+HF_TOKEN=$(cat ~/.config/hf/token) ./scripts/fetch-library.sh   # LTX-2.5 is gated
+```
+
+Then `make verify`. Its first stage, `scripts/verify-workflows.sh`, checks
+every manifest path against its graph, that each referenced model file is
+present, and that no tag has two defaults — with no container running.
+
+### Precision on the GB10
+
+Image DiTs are memory-bandwidth-bound on this box, so smaller weights are
+faster as well as smaller: measured on Z-Image Turbo, the NVFP4 transformer
+is ~1.4-1.5x faster warm than bf16 and halves the reload time, with no
+visible quality difference at the same seed — while every FP8 variant is
+*slower* than bf16 (comfy-kitchen's CUDA backend here has a native NVFP4
+matmul but no native FP8 one). Video is compute-bound, so precision only buys
+download size; the 8-step distill is what buys speed. Hence NVFP4/int8 files
+throughout, with Z-Image's bf16 pair kept for comparisons.
+
+### Why the image needs a C compiler
+
+torch 2.13 implements some ops (`torch._native`, e.g. `bmm_outer_product`)
+as Triton kernels, and Triton compiles a small C launcher against the Python
+headers on first use. Without `gcc` + `python3-dev` every modern text encoder
+(Qwen3, Qwen3-VL, Gemma) fails at `CLIPTextEncode` with "Failed to find C
+compiler". SD 1.5's CLIP never takes that path, which is why `verify-e2e.sh`
+alone would not have caught it.
+
 ## Commands
 
 Run `make` on its own for the full list. The common ones: `build`, `up`,

@@ -1,0 +1,19 @@
+{
+  "description": "Qwen-Image 2.1 text-to-image (7B, int8). Best-in-class text rendering; native 2K. Size comes from aspect + megapixels via the template's ResolutionSelector; passing width/height overrides it with literal pixels.",
+  "tags": ["txt2img"],
+  "params": {
+    "prompt":     { "path": "459:452.inputs.prompt",           "type": "string", "required": true },
+    "negative":   { "path": "459:452.inputs.negative_prompt",  "type": "string", "default": "" },
+    "seed":       { "path": "459:458.inputs.seed",             "type": "int",    "default": "random" },
+    "steps":      { "path": "459:458.inputs.steps",            "type": "int",    "default": 25 },
+    "cfg":        { "path": "459:458.inputs.cfg",              "type": "float",  "default": 1 },
+    "aspect":     { "path": "13.inputs.aspect_ratio",          "type": "string", "default": "1:1 (Square)" },
+    "megapixels": { "path": "13.inputs.megapixels",            "type": "float",  "default": 1 },
+    "width":      { "path": "459:456.inputs.width",            "type": "int" },
+    "height":     { "path": "459:456.inputs.height",           "type": "int" },
+    "resolution": { "path": "459:452.inputs.resolution",       "type": "int",    "default": 1024 },
+    "model":      { "path": "459:451.inputs.unet_name",        "type": "model",  "folder": "diffusion_models" },
+    "encoder":    { "path": "459:453.inputs.clip_name",        "type": "model",  "folder": "text_encoders" },
+    "prefix":     { "path": "461.inputs.filename_prefix",      "type": "string", "default": "qwen-image-2.1" }
+  }
+}

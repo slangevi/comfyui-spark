@@ -1,0 +1,15 @@
+{
+  "description": "Z-Image Turbo (6B, 8 steps). Default is the NVFP4 transformer + FP8-mixed encoder, measured 1.37x faster than bf16 on the GB10; swap with --set model=z_image_turbo_bf16.safetensors --set encoder=qwen_3_4b.safetensors to compare. cfg is 1, so there is no negative prompt.",
+  "tags": ["txt2img", "default"],
+  "params": {
+    "prompt":   { "path": "57:27.inputs.text",        "type": "string", "required": true },
+    "seed":     { "path": "57:3.inputs.seed",         "type": "int",    "default": "random" },
+    "steps":    { "path": "57:3.inputs.steps",        "type": "int",    "default": 8 },
+    "cfg":      { "path": "57:3.inputs.cfg",          "type": "float",  "default": 1 },
+    "width":    { "path": "57:13.inputs.width",       "type": "int",    "default": 1024 },
+    "height":   { "path": "57:13.inputs.height",      "type": "int",    "default": 1024 },
+    "model":    { "path": "57:28.inputs.unet_name",   "type": "model",  "folder": "diffusion_models" },
+    "encoder":  { "path": "57:30.inputs.clip_name",   "type": "model",  "folder": "text_encoders" },
+    "prefix":   { "path": "9.inputs.filename_prefix", "type": "string", "default": "z-image-turbo" }
+  }
+}

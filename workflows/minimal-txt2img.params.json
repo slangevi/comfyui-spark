@@ -1,6 +1,6 @@
 {
   "description": "Minimal SD1.5 text-to-image",
-  "tags": ["txt2img", "default"],
+  "tags": ["txt2img"],
   "params": {
     "prompt":     { "path": "6.inputs.text",      "type": "string", "required": true },
     "negative":   { "path": "7.inputs.text",      "type": "string", "default": "" },

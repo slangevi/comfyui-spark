@@ -1,0 +1,16 @@
+{
+  "description": "LTX-2.5 text-to-video with synchronized audio (22B distilled, int8). Two-stage: half-resolution sample, 2x latent upscale, refine. Frame count is duration*fps+1; size comes from aspect + megapixels. `enhance` runs the prompt through the bundled Gemma-4 2B enhancer first.",
+  "tags": ["video", "default"],
+  "params": {
+    "prompt":     { "path": "405:376.inputs.value",        "type": "string", "required": true },
+    "negative":   { "path": "405:373.inputs.text",         "type": "string", "default": "pc game, console game, video game, cartoon, childish, ugly" },
+    "seed":       { "path": "405:339.inputs.noise_seed",   "type": "int",    "default": "random" },
+    "duration":   { "path": "405:362.inputs.value",        "type": "int",    "default": 5 },
+    "fps":        { "path": "405:361.inputs.value",        "type": "int",    "default": 24 },
+    "aspect":     { "path": "409.inputs.aspect_ratio",     "type": "string", "default": "16:9 (Widescreen)" },
+    "megapixels": { "path": "409.inputs.megapixels",       "type": "float",  "default": 0.9 },
+    "enhance":    { "path": "405:383.inputs.value",        "type": "bool",   "default": false },
+    "model":      { "path": "405:384.inputs.unet_name",    "type": "model",  "folder": "diffusion_models" },
+    "prefix":     { "path": "75.inputs.filename_prefix",   "type": "string", "default": "video/ltx-2.5-t2v" }
+  }
+}
