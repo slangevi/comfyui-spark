@@ -60,6 +60,29 @@ make fetch-model URL=<sdxl-base-safetensors-url> DEST=checkpoints
 ./scripts/verify-e2e.sh
 ```
 
+## Workflow parameter manifests
+
+A workflow may ship a sibling `<name>.params.json` naming the inputs that are
+meant to be varied:
+
+```json
+{
+  "description": "Minimal SD1.5 text-to-image",
+  "tags": ["txt2img", "default"],
+  "params": {
+    "prompt": { "path": "6.inputs.text", "type": "string", "required": true },
+    "seed":   { "path": "3.inputs.seed", "type": "int", "default": "random" }
+  }
+}
+```
+
+Nothing in this repo reads these files — they are for callers driving the API.
+sandbox-env mounts this directory into agent sandboxes read-only, and its
+`comfy` helper uses the manifest to turn `--prompt "..."` into the right node
+input, with `tags` selecting which workflow `comfy txt2img` and `comfy video`
+reach for. Types are injected as real JSON types: `int` matters, because
+ComfyUI rejects `"42"` where it wants `42`.
+
 ## Commands
 
 Run `make` on its own for the full list. The common ones: `build`, `up`,
