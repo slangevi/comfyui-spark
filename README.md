@@ -102,10 +102,23 @@ make the helper silently pick whichever sorts first.
 
 Timings are from a GB10 at the manifests' defaults. **Warm** is a second
 run of the same workflow with a fresh seed; **reload** is the first run after
-a *different* model family has executed — ComfyUI reloads each family from
-disk on every switch, even with `--highvram`, so agents should batch
-generations by model. A re-run with an *identical* seed returns in ~2 s
-because ComfyUI's node cache short-circuits it; that is not a generation.
+a *different* model family has executed. A re-run with an *identical* seed
+returns in ~2 s because ComfyUI's node cache short-circuits it; that is not a
+generation.
+
+**Why every switch reloads, and why no flag fixes it.** ComfyUI decides
+whether it can keep a model resident from the "free VRAM" it measures, and on
+the GB10's unified memory that number is the host's `MemFree` — which excludes
+the tens of GB of *reclaimable* page cache that reading the model files leaves
+behind (measured: 61 GiB "free" with 39 GiB of cache and 98 GiB actually
+available). With Z-Image + Qwen + LTX weights at ~63 GB plus activation
+headroom for a 22B video model, evicting the previous family is the correct
+call by that accounting. Measured Z-Image reload after another family ran:
+`--highvram` 61–68 s, `--highvram --disable-dynamic-vram` 61–63 s,
+`--gpu-only` 61–63 s — identical. (`--gpu-only` and `--highvram` are mutually
+exclusive; passing both makes ComfyUI exit at startup.) The mitigation is
+operational: **batch generations by model**, and expect ~60 s (image) to
+~200–300 s (video) on the first call after switching.
 
 Fetch everything the library needs (idempotent, ~90 GB on disk):
 
