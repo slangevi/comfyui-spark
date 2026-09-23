@@ -6,8 +6,8 @@ FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04@sha256:88bc2ff57b4a4cbb3dc900cf49220
 
 ARG PUID=1000
 ARG PGID=1000
-# ComfyUI v0.33.1, pinned 2026-08-18. Bump via `make update-comfyui`.
-ARG COMFYUI_REF=72865f4f27eaf5396f8f36370e0a2be3a9a090ee
+# ComfyUI v0.37.1, pinned 2026-09-22. Bump via `make update-comfyui`.
+ARG COMFYUI_REF=3f767e7f67bc587e88d6de6668eb424f725d4649
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
